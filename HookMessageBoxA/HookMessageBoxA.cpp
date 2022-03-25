@@ -6,6 +6,7 @@
 #define OPER1 CTL_CODE(FILE_DEVICE_UNKNOWN,0x800,METHOD_BUFFERED,FILE_ANY_ACCESS)
 #define OPER2 CTL_CODE(FILE_DEVICE_UNKNOWN,0x900,METHOD_BUFFERED,FILE_ANY_ACCESS)
 #define OPER_SETINT CTL_CODE(FILE_DEVICE_UNKNOWN,0x845,METHOD_BUFFERED,FILE_ANY_ACCESS)
+#define OPER_RETURNREC CTL_CODE(FILE_DEVICE_UNKNOWN,0x945,METHOD_BUFFERED,FILE_ANY_ACCESS)
 
 void HookMessageBoxAUnload(IN PDRIVER_OBJECT DriverObject);
 
@@ -203,6 +204,12 @@ NTSTATUS IrpDeviceContrlProc(PDEVICE_OBJECT DeviceObject, PIRP pIrp) {
             DbgPrint("ÉèÖÃÖÐ¶ÏºÅ:%x  \n", INTNumber);
             *(USHORT *) pIoBuffer = INTNumber;
             pIrp->IoStatus.Information = sizeof(USHORT);
+            break;
+        }
+        case OPER_RETURNREC: {
+            *(PDING_RECORDER) pIoBuffer = g_Recorder;
+            pIrp->IoStatus.Information = sizeof(DING_RECORDER);
+            g_Recorder.number = 0;
             break;
         }
     }
