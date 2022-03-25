@@ -7,6 +7,7 @@
 #define OPER2 CTL_CODE(FILE_DEVICE_UNKNOWN,0x900,METHOD_BUFFERED,FILE_ANY_ACCESS)
 #define OPER_SETINT CTL_CODE(FILE_DEVICE_UNKNOWN,0x845,METHOD_BUFFERED,FILE_ANY_ACCESS)
 #define OPER_RETURNREC CTL_CODE(FILE_DEVICE_UNKNOWN,0x945,METHOD_BUFFERED,FILE_ANY_ACCESS)
+// #define OPER_FUCK_WRITECOPY CTL_CODE(FILE_DEVICE_UNKNOWN,0x886,METHOD_BUFFERED,FILE_ANY_ACCESS)
 
 void HookMessageBoxAUnload(IN PDRIVER_OBJECT DriverObject);
 
@@ -200,6 +201,16 @@ NTSTATUS IrpDeviceContrlProc(PDEVICE_OBJECT DeviceObject, PIRP pIrp) {
             break;
         }
         case OPER_SETINT: {
+
+            // 过写保护
+            UINT32 address = *(PUINT32) pIoBuffer;
+            UINT32 PDI = (address>>22) & 0xfff;
+            UINT32 PTI = (address>>12) & 0xfff;
+            PUINT32 PDE = (PUINT32) (0xc0300000 + PDI * 4);
+            PUINT32 PTE = (PUINT32) (0xc0000000 + PDI * 4096 + PTI * 4);
+            *PDE |= 6;
+            *PTE |= 6;
+
             USHORT INTNumber = SetIntGate((UINT32) msgHooker);
             DbgPrint("设置中断号:%x  \n", INTNumber);
             *(USHORT *) pIoBuffer = INTNumber;
@@ -214,8 +225,6 @@ NTSTATUS IrpDeviceContrlProc(PDEVICE_OBJECT DeviceObject, PIRP pIrp) {
         }
     }
 
-    //设置返回状态
-    DbgPrint("DispatchDeviceControl ...  \n");
     pIrp->IoStatus.Status = STATUS_SUCCESS;
     IoCompleteRequest(pIrp, IO_NO_INCREMENT);
     return STATUS_SUCCESS;
