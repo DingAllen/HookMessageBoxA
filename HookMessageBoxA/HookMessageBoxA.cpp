@@ -1,195 +1,255 @@
 #include "stdafx.h"
 
-/*
-	HookMessageBoxA - Main file
-	This file contains a very simple implementation of a WDM driver. Note that it does not support all
-	WDM functionality, or any functionality sufficient for practical use. The only thing this driver does
-	perfectly, is loading and unloading.
-
-	To install the driver, go to Control Panel -> Add Hardware Wizard, then select "Add a new hardware device".
-	Select "manually select from list", choose device category, press "Have Disk" and enter the path to your
-	INF file.
-	Note that not all device types (specified as Class in INF file) can be installed that way.
-
-	To start/stop this driver, use Windows Device Manager (enable/disable device command).
-
-	If you want to speed up your driver development, it is recommended to see the BazisLib library, that
-	contains convenient classes for standard device types, as well as a more powerful version of the driver
-	wizard. To get information about BazisLib, see its website:
-		http://bazislib.sysprogs.org/
-*/
-
 void HookMessageBoxAUnload(IN PDRIVER_OBJECT DriverObject);
+
 NTSTATUS HookMessageBoxACreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
+
 NTSTATUS HookMessageBoxADefaultHandler(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
-NTSTATUS HookMessageBoxAAddDevice(IN PDRIVER_OBJECT  DriverObject, IN PDEVICE_OBJECT  PhysicalDeviceObject);
+
+NTSTATUS HookMessageBoxAAddDevice(IN PDRIVER_OBJECT DriverObject, IN PDEVICE_OBJECT PhysicalDeviceObject);
+
 NTSTATUS HookMessageBoxAPnP(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
 
-typedef struct _deviceExtension
-{
-	PDEVICE_OBJECT DeviceObject;
-	PDEVICE_OBJECT TargetDeviceObject;
-	PDEVICE_OBJECT PhysicalDeviceObject;
-	UNICODE_STRING DeviceInterface;
+typedef struct _deviceExtension {
+    PDEVICE_OBJECT DeviceObject;
+    PDEVICE_OBJECT TargetDeviceObject;
+    PDEVICE_OBJECT PhysicalDeviceObject;
+    UNICODE_STRING DeviceInterface;
 } HookMessageBoxA_DEVICE_EXTENSION, *PHookMessageBoxA_DEVICE_EXTENSION;
 
 // {4a8374da-c2db-4895-b7a0-8deed89b4643}
-static const GUID GUID_HookMessageBoxAInterface = {0x4A8374DA, 0xc2db, 0x4895, {0xb7, 0xa0, 0x8d, 0xee, 0xd8, 0x9b, 0x46, 0x43 } };
+static const GUID GUID_HookMessageBoxAInterface = {0x4A8374DA, 0xc2db, 0x4895,
+                                                   {0xb7, 0xa0, 0x8d, 0xee, 0xd8, 0x9b, 0x46, 0x43}};
+
+PDEVICE_OBJECT g_pDevObj = NULL; // 自定义设备，用于和3环通信
 
 #ifdef __cplusplus
-extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING  RegistryPath);
+extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING RegistryPath);
 #endif
 
-NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING  RegistryPath)
-{
-	unsigned i;
+// 构造提权中断门，返回中断号
+USHORT SetIntGate(UINT32 pFuncion) {
+    UCHAR IDT[6]; // IDT寄存器
+    UINT32 IdtAddr, IdtLen;
+    UINT32 IntGateHi = 0, IntGateLo = 0; // 中断门描述符
+    UINT32 *pPreIntGateAddr = (UINT32 *) g_pDevObj->DeviceExtension + 1;
+    UINT32 i;
+    // 构造中断门描述符
+    IntGateLo = ((pFuncion & 0x0000FFFF) | 0x00080000);
+    IntGateHi = ((pFuncion & 0xFFFF0000) | 0x0000EE00);
+    // 遍历IDT，找无效项
+    _asm{
+            sidt fword ptr IDT;
+    }
+    IdtAddr = *(PULONG) (IDT + 2);
+    IdtLen = *(PUSHORT) IDT;
+    // 遍历IDT，找一个P=0的（跳过第一项）
+    if ((*pPreIntGateAddr) == 0) {
+        for (i = 8; i < IdtLen; i += 8) {
+            if ((((PUINT32) (IdtAddr + i))[1] & 0x00008000) == 0) {
+                // P=0，此处GDT表项无效，可以使用
+                ((PUINT32) (IdtAddr + i))[0] = IntGateLo;
+                ((PUINT32) (IdtAddr + i))[1] = IntGateHi;
+                (*pPreIntGateAddr) = IdtAddr + i;
+                break;
+            }
+        }
+    } else {
+        ((PUINT32) (*pPreIntGateAddr))[0] = IntGateLo;
+        ((PUINT32) (*pPreIntGateAddr))[1] = IntGateHi;
+    }
 
-	DbgPrint("Hello from HookMessageBoxA!\n");
-	
-	for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
-		DriverObject->MajorFunction[i] = HookMessageBoxADefaultHandler;
-
-	DriverObject->MajorFunction[IRP_MJ_CREATE] = HookMessageBoxACreateClose;
-	DriverObject->MajorFunction[IRP_MJ_CLOSE] = HookMessageBoxACreateClose;
-	DriverObject->MajorFunction[IRP_MJ_PNP] = HookMessageBoxAPnP;
-
-	DriverObject->DriverUnload = HookMessageBoxAUnload;
-	DriverObject->DriverStartIo = NULL;
-	DriverObject->DriverExtension->AddDevice = HookMessageBoxAAddDevice;
-
-	return STATUS_SUCCESS;
+    //DbgPrint("*pPreIntGateAddr: %p.\n", *pPreIntGateAddr);
+    //DbgPrint("INT %02X\n", (USHORT)((*pPreIntGateAddr - IdtAddr) / 8));
+    if (*pPreIntGateAddr == 0) return 0;
+    return (USHORT) ((*pPreIntGateAddr - IdtAddr) / 8);
 }
 
-void HookMessageBoxAUnload(IN PDRIVER_OBJECT DriverObject)
-{
-	DbgPrint("Goodbye from HookMessageBoxA!\n");
+// 构造提权调用门，返回调用门选择子
+USHORT SetCallGate(UINT32 pFunction, UINT32 nParam) {
+    UINT32 CallGateHi = 0, CallGateLo = 0; // 调用门描述符
+    UCHAR GDT[6]; // GDT寄存器
+    UINT32 GdtAddr, GdtLen;
+    UINT32 i;
+    UINT32 *pPreCallGateAddr = (UINT32 *) g_pDevObj->DeviceExtension;
+
+    // 构造调用门
+    CallGateHi = (pFunction & 0xFFFF0000);
+    CallGateHi |= 0x0000EC00;
+    CallGateHi |= nParam;
+    CallGateLo = (pFunction & 0x0000FFFF);
+    CallGateLo |= 0x00080000;
+    // 获取GDT基址和大小
+    _asm
+    {
+        sgdt
+        fword
+        ptr GDT;
+    }
+    GdtAddr = *(PULONG) (GDT + 2);
+    GdtLen = *(PUSHORT) GDT;
+    // 遍历GDT，找一个P=0的（跳过第一项）
+    if ((*pPreCallGateAddr) == 0) {
+        for (i = 8; i < GdtLen; i += 8) {
+            //DbgPrint("%p\n",(PUINT32)(GdtAddr + i));
+            if ((((PUINT32) (GdtAddr + i))[1] & 0x00008000) == 0) {
+                // P=0，此处GDT表项无效，可以使用
+                ((PUINT32) (GdtAddr + i))[0] = CallGateLo;
+                ((PUINT32) (GdtAddr + i))[1] = CallGateHi;
+                (*pPreCallGateAddr) = GdtAddr + i;
+                break;
+            }
+        }
+    } else {
+        ((PUINT32) (*pPreCallGateAddr))[0] = CallGateLo;
+        ((PUINT32) (*pPreCallGateAddr))[1] = CallGateHi;
+    }
+    if (*pPreCallGateAddr == 0) return 0;
+    return (USHORT) ((*pPreCallGateAddr) - GdtAddr);
 }
 
-NTSTATUS HookMessageBoxACreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
-{
-	Irp->IoStatus.Status = STATUS_SUCCESS;
-	Irp->IoStatus.Information = 0;
-	IoCompleteRequest(Irp, IO_NO_INCREMENT);
-	return STATUS_SUCCESS;
+NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING RegistryPath) {
+    unsigned i;
+
+    DbgPrint("Hello from HookMessageBoxA!\n");
+
+    for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+        DriverObject->MajorFunction[i] = HookMessageBoxADefaultHandler;
+
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = HookMessageBoxACreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = HookMessageBoxACreateClose;
+    DriverObject->MajorFunction[IRP_MJ_PNP] = HookMessageBoxAPnP;
+
+    DriverObject->DriverUnload = HookMessageBoxAUnload;
+    DriverObject->DriverStartIo = NULL;
+    DriverObject->DriverExtension->AddDevice = HookMessageBoxAAddDevice;
+
+    return STATUS_SUCCESS;
 }
 
-NTSTATUS HookMessageBoxADefaultHandler(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
-{
-	PHookMessageBoxA_DEVICE_EXTENSION deviceExtension = NULL;
-	
-	IoSkipCurrentIrpStackLocation(Irp);
-	deviceExtension = (PHookMessageBoxA_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
-	return IoCallDriver(deviceExtension->TargetDeviceObject, Irp);
+void HookMessageBoxAUnload(IN PDRIVER_OBJECT DriverObject) {
+    DbgPrint("Goodbye from HookMessageBoxA!\n");
 }
 
-NTSTATUS HookMessageBoxAAddDevice(IN PDRIVER_OBJECT  DriverObject, IN PDEVICE_OBJECT  PhysicalDeviceObject)
-{
-	PDEVICE_OBJECT DeviceObject = NULL;
-	PHookMessageBoxA_DEVICE_EXTENSION pExtension = NULL;
-	NTSTATUS status;
-	
-	status = IoCreateDevice(DriverObject,
-						    sizeof(HookMessageBoxA_DEVICE_EXTENSION),
-							NULL,
-							FILE_DEVICE_UNKNOWN,
-							0,
-							0,
-							&DeviceObject);
+NTSTATUS HookMessageBoxACreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
 
-	if (!NT_SUCCESS(status))
-		return status;
+NTSTATUS HookMessageBoxADefaultHandler(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
+    PHookMessageBoxA_DEVICE_EXTENSION deviceExtension = NULL;
 
-	pExtension = (PHookMessageBoxA_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    IoSkipCurrentIrpStackLocation(Irp);
+    deviceExtension = (PHookMessageBoxA_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
+    return IoCallDriver(deviceExtension->TargetDeviceObject, Irp);
+}
 
-	pExtension->DeviceObject = DeviceObject;
-	pExtension->PhysicalDeviceObject = PhysicalDeviceObject;
-	pExtension->TargetDeviceObject = IoAttachDeviceToDeviceStack(DeviceObject, PhysicalDeviceObject);
+NTSTATUS HookMessageBoxAAddDevice(IN PDRIVER_OBJECT DriverObject, IN PDEVICE_OBJECT PhysicalDeviceObject) {
+    PDEVICE_OBJECT DeviceObject = NULL;
+    PHookMessageBoxA_DEVICE_EXTENSION pExtension = NULL;
+    NTSTATUS status;
 
-	status = IoRegisterDeviceInterface(PhysicalDeviceObject, &GUID_HookMessageBoxAInterface, NULL, &pExtension->DeviceInterface);
-	ASSERT(NT_SUCCESS(status));
+    status = IoCreateDevice(DriverObject,
+                            sizeof(HookMessageBoxA_DEVICE_EXTENSION),
+                            NULL,
+                            FILE_DEVICE_UNKNOWN,
+                            0,
+                            0,
+                            &DeviceObject);
 
-	DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
-	return STATUS_SUCCESS;
+    if (!NT_SUCCESS(status))
+        return status;
+
+    pExtension = (PHookMessageBoxA_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
+
+    pExtension->DeviceObject = DeviceObject;
+    pExtension->PhysicalDeviceObject = PhysicalDeviceObject;
+    pExtension->TargetDeviceObject = IoAttachDeviceToDeviceStack(DeviceObject, PhysicalDeviceObject);
+
+    status = IoRegisterDeviceInterface(PhysicalDeviceObject, &GUID_HookMessageBoxAInterface, NULL,
+                                       &pExtension->DeviceInterface);
+    ASSERT(NT_SUCCESS(status));
+
+    DeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+    return STATUS_SUCCESS;
 }
 
 
 NTSTATUS HookMessageBoxAIrpCompletion(
-					  IN PDEVICE_OBJECT DeviceObject,
-					  IN PIRP Irp,
-					  IN PVOID Context
-					  )
-{
-	PKEVENT Event = (PKEVENT) Context;
+        IN PDEVICE_OBJECT DeviceObject,
+        IN PIRP Irp,
+        IN PVOID Context
+) {
+    PKEVENT Event = (PKEVENT) Context;
 
-	UNREFERENCED_PARAMETER(DeviceObject);
-	UNREFERENCED_PARAMETER(Irp);
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Irp);
 
-	KeSetEvent(Event, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(Event, IO_NO_INCREMENT, FALSE);
 
-	return(STATUS_MORE_PROCESSING_REQUIRED);
+    return (STATUS_MORE_PROCESSING_REQUIRED);
 }
 
 NTSTATUS HookMessageBoxAForwardIrpSynchronous(
-							  IN PDEVICE_OBJECT DeviceObject,
-							  IN PIRP Irp
-							  )
-{
-	PHookMessageBoxA_DEVICE_EXTENSION   deviceExtension;
-	KEVENT event;
-	NTSTATUS status;
+        IN PDEVICE_OBJECT DeviceObject,
+        IN PIRP Irp
+) {
+    PHookMessageBoxA_DEVICE_EXTENSION deviceExtension;
+    KEVENT event;
+    NTSTATUS status;
 
-	KeInitializeEvent(&event, NotificationEvent, FALSE);
-	deviceExtension = (PHookMessageBoxA_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+    deviceExtension = (PHookMessageBoxA_DEVICE_EXTENSION) DeviceObject->DeviceExtension;
 
-	IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoCopyCurrentIrpStackLocationToNext(Irp);
 
-	IoSetCompletionRoutine(Irp, HookMessageBoxAIrpCompletion, &event, TRUE, TRUE, TRUE);
+    IoSetCompletionRoutine(Irp, HookMessageBoxAIrpCompletion, &event, TRUE, TRUE, TRUE);
 
-	status = IoCallDriver(deviceExtension->TargetDeviceObject, Irp);
+    status = IoCallDriver(deviceExtension->TargetDeviceObject, Irp);
 
-	if (status == STATUS_PENDING) {
-		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-		status = Irp->IoStatus.Status;
-	}
-	return status;
+    if (status == STATUS_PENDING) {
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        status = Irp->IoStatus.Status;
+    }
+    return status;
 }
 
-NTSTATUS HookMessageBoxAPnP(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
-{
-	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-	PHookMessageBoxA_DEVICE_EXTENSION pExt = ((PHookMessageBoxA_DEVICE_EXTENSION)DeviceObject->DeviceExtension);
-	NTSTATUS status;
+NTSTATUS HookMessageBoxAPnP(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp) {
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    PHookMessageBoxA_DEVICE_EXTENSION pExt = ((PHookMessageBoxA_DEVICE_EXTENSION) DeviceObject->DeviceExtension);
+    NTSTATUS status;
 
-	ASSERT(pExt);
+    ASSERT(pExt);
 
-	switch (irpSp->MinorFunction)
-	{
-	case IRP_MN_START_DEVICE:
-		IoSetDeviceInterfaceState(&pExt->DeviceInterface, TRUE);
-		Irp->IoStatus.Status = STATUS_SUCCESS;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return STATUS_SUCCESS;
+    switch (irpSp->MinorFunction) {
+        case IRP_MN_START_DEVICE:
+            IoSetDeviceInterfaceState(&pExt->DeviceInterface, TRUE);
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_SUCCESS;
 
-	case IRP_MN_QUERY_REMOVE_DEVICE:
-		Irp->IoStatus.Status = STATUS_SUCCESS;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return STATUS_SUCCESS;
+        case IRP_MN_QUERY_REMOVE_DEVICE:
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_SUCCESS;
 
-	case IRP_MN_REMOVE_DEVICE:
-		IoSetDeviceInterfaceState(&pExt->DeviceInterface, FALSE);
-		status = HookMessageBoxAForwardIrpSynchronous(DeviceObject, Irp);
-		IoDetachDevice(pExt->TargetDeviceObject);
-		IoDeleteDevice(pExt->DeviceObject);
-		RtlFreeUnicodeString(&pExt->DeviceInterface);
-		Irp->IoStatus.Status = STATUS_SUCCESS;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return STATUS_SUCCESS;
+        case IRP_MN_REMOVE_DEVICE:
+            IoSetDeviceInterfaceState(&pExt->DeviceInterface, FALSE);
+            status = HookMessageBoxAForwardIrpSynchronous(DeviceObject, Irp);
+            IoDetachDevice(pExt->TargetDeviceObject);
+            IoDeleteDevice(pExt->DeviceObject);
+            RtlFreeUnicodeString(&pExt->DeviceInterface);
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_SUCCESS;
 
-	case IRP_MN_QUERY_PNP_DEVICE_STATE:
-		status = HookMessageBoxAForwardIrpSynchronous(DeviceObject, Irp);
-		Irp->IoStatus.Information = 0;
-		IoCompleteRequest(Irp, IO_NO_INCREMENT);
-		return status;
-	}
-	return HookMessageBoxADefaultHandler(DeviceObject, Irp);
+        case IRP_MN_QUERY_PNP_DEVICE_STATE:
+            status = HookMessageBoxAForwardIrpSynchronous(DeviceObject, Irp);
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return status;
+    }
+    return HookMessageBoxADefaultHandler(DeviceObject, Irp);
 }
