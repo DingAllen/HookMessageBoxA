@@ -1,5 +1,12 @@
 #include "stdafx.h"
 
+#define DEVICE_NAME L"\\Device\\MsgHooker"
+#define SYMBOLICLINE_NAME L"\\??\\MsgHooker"  //ring3用CreateFile打开设备时,用"\\\\.\\MyTestDriver"//相当于起的别名
+
+#define OPER1 CTL_CODE(FILE_DEVICE_UNKNOWN,0x800,METHOD_BUFFERED,FILE_ANY_ACCESS)
+#define OPER2 CTL_CODE(FILE_DEVICE_UNKNOWN,0x900,METHOD_BUFFERED,FILE_ANY_ACCESS)
+#define OPER_SETINT CTL_CODE(FILE_DEVICE_UNKNOWN,0x845,METHOD_BUFFERED,FILE_ANY_ACCESS)
+
 void HookMessageBoxAUnload(IN PDRIVER_OBJECT DriverObject);
 
 NTSTATUS HookMessageBoxACreateClose(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
@@ -17,15 +24,51 @@ typedef struct _deviceExtension {
     UNICODE_STRING DeviceInterface;
 } HookMessageBoxA_DEVICE_EXTENSION, *PHookMessageBoxA_DEVICE_EXTENSION;
 
+typedef struct _ding_recorder {
+    INT32 number;
+    INT32 x[0x10];
+} DING_RECORDER, *PDING_RECORDER;
+
+typedef struct _ding_msg {
+    INT32 state;
+    DING_RECORDER recorder;
+} DING_MSG, *PDING_MSG;
+
 // {4a8374da-c2db-4895-b7a0-8deed89b4643}
 static const GUID GUID_HookMessageBoxAInterface = {0x4A8374DA, 0xc2db, 0x4895,
                                                    {0xb7, 0xa0, 0x8d, 0xee, 0xd8, 0x9b, 0x46, 0x43}};
 
 PDEVICE_OBJECT g_pDevObj = NULL; // 自定义设备，用于和3环通信
+DING_RECORDER g_Recorder; // 定义一个全局的recorder，在3环300ms轮询一次
 
 #ifdef __cplusplus
 extern "C" NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING RegistryPath);
 #endif
+
+VOID __stdcall realHooker(INT32 ESP3) {
+
+    DING_RECORDER recorder;
+    recorder.number = 4;
+    recorder.x[0] = ((PINT32) ESP3)[1];
+    recorder.x[1] = ((PINT32) ESP3)[2];
+    recorder.x[2] = ((PINT32) ESP3)[3];
+    recorder.x[3] = ((PINT32) ESP3)[4];
+    g_Recorder = recorder;
+}
+
+VOID msgHooker() {
+
+    _asm{
+            pushad;
+            pushfd;
+            mov eax,[esp + 0x24 + 0x0C];
+            push eax;
+            call realHooker;
+            popfd;
+            popad;
+            iretd;
+    }
+}
 
 // 构造提权中断门，返回中断号
 USHORT SetIntGate(UINT32 pFuncion) {
@@ -82,9 +125,7 @@ USHORT SetCallGate(UINT32 pFunction, UINT32 nParam) {
     // 获取GDT基址和大小
     _asm
     {
-        sgdt
-        fword
-        ptr GDT;
+        sgdt fword ptr GDT;
     }
     GdtAddr = *(PULONG) (GDT + 2);
     GdtLen = *(PUSHORT) GDT;
@@ -108,17 +149,79 @@ USHORT SetCallGate(UINT32 pFunction, UINT32 nParam) {
     return (USHORT) ((*pPreCallGateAddr) - GdtAddr);
 }
 
+NTSTATUS IrpDeviceContrlProc(PDEVICE_OBJECT DeviceObject, PIRP pIrp) {
+
+    NTSTATUS Status = STATUS_INVALID_DEVICE_REQUEST;
+    PIO_STACK_LOCATION pIrpStack;//定义一个指向IO_STACK_LOCATION结构体的指针
+    ULONG uIoControCode;
+    PVOID pIoBuffer;
+    ULONG uInLength;
+    ULONG uOutLength;
+    ULONG uRead;
+
+    //获取缓冲区地址(输入和输出的缓冲区都是一个)
+    pIoBuffer = pIrp->AssociatedIrp.SystemBuffer;
+
+    //从当前Irp中获取数据
+    pIrpStack = IoGetCurrentIrpStackLocation(pIrp);//根据从ring3发来的
+
+    //获取控制码  Parameters里面是一个联合体  Read Write DeviceIoControl
+    uIoControCode = pIrpStack->Parameters.DeviceIoControl.IoControlCode;
+
+    //ring 3发送数据的长度
+    uInLength = pIrpStack->Parameters.DeviceIoControl.InputBufferLength;
+
+    //ring 0 发送数据的长度
+    uOutLength = pIrpStack->Parameters.DeviceIoControl.OutputBufferLength;
+
+
+    switch (uIoControCode) {
+        case OPER1: {
+            DbgPrint("IrpDeviceContrlProc -> OPER1 ...\n");
+            pIrp->IoStatus.Information = 0;
+            break;
+        }
+        case OPER2: {
+            DbgPrint("IrpDeviceContrlProc -> OPER2 接受字节数:%x  \n", uInLength);
+            DbgPrint("IrpDeviceContrlProc -> OPER2 返回字节数:%x  \n", uOutLength);
+
+            //读取3环传过来的数据
+            RtlCopyMemory(&uRead, pIoBuffer, 4);
+            DbgPrint("IrpDeviceContrlProc -> OPER2 ...%x  \n", uRead);
+
+            //把数据传回给3环
+            *(ULONG *) pIoBuffer = 0x1314520;
+
+            //set Status
+            //设置给3环返回数据的字节数
+            pIrp->IoStatus.Information = 4;
+
+            break;
+        }
+        case OPER_SETINT: {
+            USHORT INTNumber = SetIntGate((UINT32) msgHooker);
+            DbgPrint("设置中断号:%x  \n", INTNumber);
+            *(USHORT *) pIoBuffer = INTNumber;
+            pIrp->IoStatus.Information = sizeof(USHORT);
+            break;
+        }
+    }
+
+    //设置返回状态
+    DbgPrint("DispatchDeviceControl ...  \n");
+    pIrp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING RegistryPath) {
-    unsigned i;
 
-    DbgPrint("Hello from HookMessageBoxA!\n");
-
-    for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
-        DriverObject->MajorFunction[i] = HookMessageBoxADefaultHandler;
+    g_Recorder.number = 0;
 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = HookMessageBoxACreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = HookMessageBoxACreateClose;
     DriverObject->MajorFunction[IRP_MJ_PNP] = HookMessageBoxAPnP;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IrpDeviceContrlProc;
 
     DriverObject->DriverUnload = HookMessageBoxAUnload;
     DriverObject->DriverStartIo = NULL;
