@@ -196,18 +196,25 @@ NTSTATUS IrpDeviceContrlProc(PDEVICE_OBJECT DeviceObject, PIRP pIrp) {
         case OPER_SETINT: {
 
             // 过写保护
-//            UINT32 address = *(PUINT32) pIoBuffer;
-//            UINT32 PDI = (address>>22) & 0xfff;
-//            UINT32 PTI = (address>>12) & 0xfff;
-//            PUINT32 PDE = (PUINT32) (0xc0300000 + PDI * 4);
-//            PUINT32 PTE = (PUINT32) (0xc0000000 + PDI * 4096 + PTI * 4);
-//            *PDE |= 6;
-//            *PTE |= 6;
+            UINT32 address = *(PUINT32) pIoBuffer;
+            DbgPrint("address:%x  \n", address);
+            UINT32 PDI = (address>>22) & 0x3ff;
+            UINT32 PTI = (address>>12) & 0x3ff;
+            PUINT32 PDE = (PUINT32) (0xc0300000 + PDI * 4);
+            PUINT32 PTE = (PUINT32) (0xc0000000 + PDI * 4096 + PTI * 4);
+            *PDE |= 6;
+            *PTE |= 6;
+            DbgPrint("成功干掉写保护！  \n");
 
-            USHORT INTNumber = SetIntGate((UINT32) msgHooker);
+            UCHAR INTNumber = SetIntGate((UINT32) msgHooker);
             DbgPrint("设置中断号:%x  \n", INTNumber);
-            *(USHORT *) pIoBuffer = INTNumber;
-            pIrp->IoStatus.Information = sizeof(USHORT);
+
+            *(PUCHAR)address = 0xCD;
+            *((PUCHAR)address + 1) = INTNumber;
+            DbgPrint("MessageBoxA(%08lX)被成功Hook  \n", address);
+
+            *(UCHAR *) pIoBuffer = INTNumber;
+            pIrp->IoStatus.Information = sizeof(UCHAR);
             break;
         }
         case OPER_RETURNREC: {
