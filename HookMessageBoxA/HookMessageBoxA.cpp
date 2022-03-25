@@ -234,14 +234,44 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Registry
 
     g_Recorder.number = 0;
 
+    NTSTATUS status = 0;
+    ULONG uIndex = 0;
+    UNICODE_STRING Devicename;
+    UNICODE_STRING SymbolicLinkName;
+
+
+    //创建设备名称
+    RtlInitUnicodeString(&Devicename,DEVICE_NAME);
+
+    //创建设备
+    status = IoCreateDevice(DriverObject, 0, &Devicename, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &g_pDevObj);
+    if (status != STATUS_SUCCESS)
+    {
+        DbgPrint("创建设备失败! \r\n");
+        return status;
+    }
+
+    //设置交互数据方式
+    g_pDevObj->Flags |= DO_BUFFERED_IO;
+
+    //创建符号链接名称,就是给该设备在三环起个能用的别名
+    RtlInitUnicodeString(&SymbolicLinkName, SYMBOLICLINE_NAME);
+
+    //创建符号链接
+    status = IoCreateSymbolicLink(&SymbolicLinkName, &Devicename);
+    if (status != STATUS_SUCCESS)
+    {
+        DbgPrint("创建符号链接失败!\r\n");
+        IoDeleteDevice(g_pDevObj);
+        return status;
+    }
+
     DriverObject->MajorFunction[IRP_MJ_CREATE] = HookMessageBoxACreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = HookMessageBoxACreateClose;
     DriverObject->MajorFunction[IRP_MJ_PNP] = HookMessageBoxAPnP;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = IrpDeviceContrlProc;
 
     DriverObject->DriverUnload = HookMessageBoxAUnload;
-    DriverObject->DriverStartIo = NULL;
-    DriverObject->DriverExtension->AddDevice = HookMessageBoxAAddDevice;
 
     return STATUS_SUCCESS;
 }
