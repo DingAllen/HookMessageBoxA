@@ -1,0 +1,5 @@
+TARGETNAME=HookMessageBoxA
+TARGETTYPE=DRIVER
+
+SOURCES=stdafx.cpp \
+	HookMessageBoxA.cpp
