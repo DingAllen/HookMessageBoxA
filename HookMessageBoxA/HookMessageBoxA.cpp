@@ -58,7 +58,7 @@ VOID __stdcall realHooker(INT32 ESP3) {
     g_Recorder = recorder;
 }
 
-VOID msgHooker() {
+VOID __declspec(naked) msgHooker() {
 
     _asm{
             pushad;
@@ -73,11 +73,11 @@ VOID msgHooker() {
 }
 
 // 构造提权中断门，返回中断号
-USHORT SetIntGate(UINT32 pFuncion) {
+UCHAR SetIntGate(UINT32 pFuncion) {
     UCHAR IDT[6]; // IDT寄存器
     UINT32 IdtAddr, IdtLen;
     UINT32 IntGateHi = 0, IntGateLo = 0; // 中断门描述符
-    UINT32 *pPreIntGateAddr = (UINT32 *) g_pDevObj->DeviceExtension + 1;
+    UINT32 PreIntGateAddr = 0;
     UINT32 i;
     // 构造中断门描述符
     IntGateLo = ((pFuncion & 0x0000FFFF) | 0x00080000);
@@ -89,25 +89,18 @@ USHORT SetIntGate(UINT32 pFuncion) {
     IdtAddr = *(PULONG) (IDT + 2);
     IdtLen = *(PUSHORT) IDT;
     // 遍历IDT，找一个P=0的（跳过第一项）
-    if ((*pPreIntGateAddr) == 0) {
-        for (i = 8; i < IdtLen; i += 8) {
-            if ((((PUINT32) (IdtAddr + i))[1] & 0x00008000) == 0) {
-                // P=0，此处GDT表项无效，可以使用
-                ((PUINT32) (IdtAddr + i))[0] = IntGateLo;
-                ((PUINT32) (IdtAddr + i))[1] = IntGateHi;
-                (*pPreIntGateAddr) = IdtAddr + i;
-                break;
-            }
+    for (i = 8; i < IdtLen; i += 8) {
+        if ((((PUINT32) (IdtAddr + i))[1] & 0x00008000) == 0) {
+            // P=0，此处GDT表项无效，可以使用
+            ((PUINT32) (IdtAddr + i))[0] = IntGateLo;
+            ((PUINT32) (IdtAddr + i))[1] = IntGateHi;
+            PreIntGateAddr = IdtAddr + i;
+            break;
+
         }
-    } else {
-        ((PUINT32) (*pPreIntGateAddr))[0] = IntGateLo;
-        ((PUINT32) (*pPreIntGateAddr))[1] = IntGateHi;
     }
 
-    //DbgPrint("*pPreIntGateAddr: %p.\n", *pPreIntGateAddr);
-    //DbgPrint("INT %02X\n", (USHORT)((*pPreIntGateAddr - IdtAddr) / 8));
-    if (*pPreIntGateAddr == 0) return 0;
-    return (USHORT) ((*pPreIntGateAddr - IdtAddr) / 8);
+    return (UCHAR) ((PreIntGateAddr - IdtAddr) / 8);
 }
 
 // 构造提权调用门，返回调用门选择子
@@ -203,13 +196,13 @@ NTSTATUS IrpDeviceContrlProc(PDEVICE_OBJECT DeviceObject, PIRP pIrp) {
         case OPER_SETINT: {
 
             // 过写保护
-            UINT32 address = *(PUINT32) pIoBuffer;
-            UINT32 PDI = (address>>22) & 0xfff;
-            UINT32 PTI = (address>>12) & 0xfff;
-            PUINT32 PDE = (PUINT32) (0xc0300000 + PDI * 4);
-            PUINT32 PTE = (PUINT32) (0xc0000000 + PDI * 4096 + PTI * 4);
-            *PDE |= 6;
-            *PTE |= 6;
+//            UINT32 address = *(PUINT32) pIoBuffer;
+//            UINT32 PDI = (address>>22) & 0xfff;
+//            UINT32 PTI = (address>>12) & 0xfff;
+//            PUINT32 PDE = (PUINT32) (0xc0300000 + PDI * 4);
+//            PUINT32 PTE = (PUINT32) (0xc0000000 + PDI * 4096 + PTI * 4);
+//            *PDE |= 6;
+//            *PTE |= 6;
 
             USHORT INTNumber = SetIntGate((UINT32) msgHooker);
             DbgPrint("设置中断号:%x  \n", INTNumber);
@@ -241,12 +234,12 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Registry
 
 
     //创建设备名称
-    RtlInitUnicodeString(&Devicename,DEVICE_NAME);
+    RtlInitUnicodeString(&Devicename, DEVICE_NAME);
 
     //创建设备
-    status = IoCreateDevice(DriverObject, 0, &Devicename, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &g_pDevObj);
-    if (status != STATUS_SUCCESS)
-    {
+    status = IoCreateDevice(DriverObject, 0, &Devicename, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
+                            &g_pDevObj);
+    if (status != STATUS_SUCCESS) {
         DbgPrint("创建设备失败! \r\n");
         return status;
     }
@@ -259,8 +252,7 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Registry
 
     //创建符号链接
     status = IoCreateSymbolicLink(&SymbolicLinkName, &Devicename);
-    if (status != STATUS_SUCCESS)
-    {
+    if (status != STATUS_SUCCESS) {
         DbgPrint("创建符号链接失败!\r\n");
         IoDeleteDevice(g_pDevObj);
         return status;
